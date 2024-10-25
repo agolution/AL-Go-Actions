@@ -23,7 +23,6 @@ if ($ENV:GITHUB_EVENT_NAME -in @("pull_request_target", "pull_request", "merge_g
     # In case of a PR, we do not want to sign apps and we want to use versioning strategy 15 (maxValue + runNumber)
     OutputDebug "Applying settings for pull request: doNotSignApps = true, versioningStrategy = 15"
     $settings.doNotSignApps = $true
-    $settings.versioningStrategy = 15
 }
 
 if ($settings.appBuild -eq [int32]::MaxValue) {
