@@ -20,8 +20,10 @@ Run pipeline in AL-Go repository
 | artifact | | ArtifactUrl to use for the build | settings.artifact |
 | project | | Project name if the repository is setup for multiple projects | . |
 | buildMode | | Specifies a mode to use for the build steps | Default |
-| installAppsJson | | A JSON-formatted list of apps to install | \[\] |
-| installTestAppsJson | | A JSON-formatted list of test apps to install | \[\] |
+| installAppsJson | | A JSON-formatted list of apps to install | [] |
+| installTestAppsJson | | A JSON-formatted list of test apps to install | [] |
+| baselineWorkflowRunId | RunId of the baseline workflow run | |
+| baselineWorkflowSHA | SHA of the baseline workflow run | |
 
 ## OUTPUT
 

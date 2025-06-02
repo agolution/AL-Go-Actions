@@ -20,20 +20,14 @@ function DownloadTemplateRepository {
 
     # Construct API URL
     $apiUrl = $templateUrl.Split('@')[0] -replace "^(https:\/\/github\.com\/)(.*)$", "$ENV:GITHUB_API_URL/repos/`$2"
-    $branch = $templateUrl.Split('@')[1]
 
     Write-Host "TemplateUrl: $templateUrl"
     Write-Host "TemplateSha: $($templateSha.Value)"
     Write-Host "DownloadLatest: $downloadLatest"
 
     if ($downloadLatest) {
-        # Get Branches from template repository
-        $response = InvokeWebRequest -Headers $headers -Uri "$apiUrl/branches?per_page=100" -retry
-        $branchInfo = ($response.content | ConvertFrom-Json) | Where-Object { $_.Name -eq $branch }
-        if (!$branchInfo) {
-            throw "$templateUrl doesn't exist"
-        }
-        $templateSha.Value = $branchInfo.commit.sha
+        # Get latest commit SHA from the template repository
+        $templateSha.Value = GetLatestTemplateSha -headers $headers -apiUrl $apiUrl -templateUrl $templateUrl
         Write-Host "Latest SHA for $($templateUrl): $($templateSha.Value)"
     }
     $archiveUrl = "$apiUrl/zipball/$($templateSha.Value)"
@@ -41,10 +35,27 @@ function DownloadTemplateRepository {
 
     # Download template repository
     $tempName = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
-    InvokeWebRequest -Headers $headers -Uri $archiveUrl -OutFile "$tempName.zip" -retry
+    InvokeWebRequest -Headers $headers -Uri $archiveUrl -OutFile "$tempName.zip"
     Expand-7zipArchive -Path "$tempName.zip" -DestinationPath $tempName
     Remove-Item -Path "$tempName.zip"
     return $tempName
+}
+
+function GetLatestTemplateSha {
+    Param(
+        [hashtable] $headers,
+        [string] $apiUrl,
+        [string] $templateUrl
+    )
+
+    $branch = $templateUrl.Split('@')[1]
+    Write-Host "Get latest SHA for $templateUrl"
+    try {
+        $branchInfo = (InvokeWebRequest -Headers $headers -Uri "$apiUrl/branches/$branch").Content | ConvertFrom-Json
+    } catch {
+        throw "Failed to update AL-Go System Files. Could not get the latest SHA from template ($templateUrl). (Error was $($_.Exception.Message))"
+    }
+    return $branchInfo.commit.sha
 }
 
 function ModifyCICDWorkflow {
@@ -273,14 +284,53 @@ function GetWorkflowContentWithChangesFromSettings {
 
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($srcFile)
     $yaml = [Yaml]::Load($srcFile)
-    $workflowScheduleKey = "$($baseName)Schedule"
+    $yamlName = $yaml.get('name:')
+    if ($yamlName) {
+        $workflowName = $yamlName.content.SubString('name:'.Length).Trim().Trim('''"').Trim()
+    }
+    else {
+        $workflowName = $baseName
+    }
 
-    # Any workflow (except for the PullRequestHandler and reusable workflows (_*)) can have a RepoSetting called <workflowname>Schedule, which will be used to set the schedule for the workflow
-    if ($baseName -ne "PullRequestHandler" -and $baseName -notlike '_*') {
+    $workflowScheduleKey = "WorkflowSchedule"
+    $workflowConcurrencyKey = "WorkflowConcurrency"
+    foreach($key in @($workflowScheduleKey,$workflowConcurrencyKey)) {
+        if ($repoSettings.Keys -contains $key -and ($repoSettings."$key")) {
+            throw "The $key setting is not allowed in the global repository settings. Please use the workflow specific settings file or conditional settings."
+        }
+    }
+
+    # Re-read settings and this time include workflow specific settings
+    $repoSettings = ReadSettings -buildMode '' -project '' -workflowName $workflowName -userName '' -branchName '' | ConvertTo-HashTable -recurse
+
+    # Old Schedule key is deprecated, but still supported
+    $oldWorkflowScheduleKey = "$($baseName)Schedule"
+    if ($repoSettings.Keys -contains $oldWorkflowScheduleKey) {
+        # DEPRECATION: REPLACE WITH ERROR AFTER October 1st 2025 --->
         if ($repoSettings.Keys -contains $workflowScheduleKey) {
-            # Read the section under the on: key and add the schedule section
-            $yamlOn = $yaml.Get('on:/')
-            $yaml.Replace('on:/', $yamlOn.content+@('schedule:', "  - cron: '$($repoSettings."$workflowScheduleKey")'"))
+            OutputWarning "Both $oldWorkflowScheduleKey and $workflowScheduleKey are defined in the settings file. $oldWorkflowScheduleKey will be ignored. This warning will become an error in the future"
+        }
+        else {
+            Trace-DeprecationWarning -Message "$oldWorkflowScheduleKey is deprecated" -DeprecationTag "_workflow_Schedule" -WillBecomeError
+            # Convert the old <workflow>Schedule setting to the new WorkflowSchedule setting
+            $repoSettings."$workflowScheduleKey" = @{ "cron" = $repoSettings."$oldWorkflowScheduleKey" }
+        }
+        # <--- REPLACE WITH ERROR AFTER October 1st 2025
+    }
+
+    # Any workflow (except for the PullRequestHandler and reusable workflows (_*)) can have concurrency and schedule defined
+    if ($baseName -ne "PullRequestHandler" -and $baseName -notlike '_*') {
+        # Add Schedule and Concurrency settings to the workflow
+        if ($repoSettings.Keys -contains $workflowScheduleKey) {
+            if ($repoSettings."$workflowScheduleKey" -isnot [hashtable] -or $repoSettings."$workflowScheduleKey".Keys -notcontains 'cron' -or $repoSettings."$workflowScheduleKey".cron -isnot [string]) {
+                throw "The $workflowScheduleKey setting must be a structure containing a cron property"
+            }
+            # Replace or add the schedule part under the on: key
+            $yaml.ReplaceOrAdd('on:/', 'schedule:', @("- cron: '$($repoSettings."$workflowScheduleKey".cron)'"))
+        }
+        if ($repoSettings.Keys -contains $workflowConcurrencyKey) {
+            # Replace or add the concurrency part
+            $yaml.ReplaceOrAdd('', 'concurrency:', $repoSettings."$workflowConcurrencyKey")
         }
     }
 

@@ -27,7 +27,7 @@ try {
     $outSecrets = [ordered]@{}
     $settings = $env:Settings | ConvertFrom-Json | ConvertTo-HashTable
     $keyVaultCredentials = GetKeyVaultCredentials
-    $getAppDependencyProbingPathsSecrets = $false
+    $getAppDependencySecrets = $false
     $getTokenForPush = $false
     [System.Collections.ArrayList]$secretsCollection = @()
     foreach($secret in ($getSecrets.Split(',') | Select-Object -Unique)) {
@@ -37,9 +37,9 @@ try {
             # If we are using the ghTokenWorkflow for commits, we need to get ghTokenWorkflow secret
             $secret = 'ghTokenWorkflow'
         }
-        $secretNameProperty = "$($secret.TrimStart('*'))SecretName"
-        if ($secret -eq 'AppDependencyProbingPathsSecrets') {
-            $getAppDependencyProbingPathsSecrets = $true
+        $secretNameProperty = "$($secret.TrimStart('-*'))SecretName"
+        if ($secret -eq 'AppDependencySecrets') {
+            $getAppDependencySecrets = $true
         }
         else {
             $secretName = $secret
@@ -61,12 +61,34 @@ try {
         }
     }
 
-    # Loop through appDependencyProbingPaths and add secrets to the collection of secrets to get
-    if ($getAppDependencyProbingPathsSecrets -and $settings.Keys -contains 'appDependencyProbingPaths') {
-        foreach($appDependencyProbingPath in $settings.appDependencyProbingPaths) {
-            if ($appDependencyProbingPath.PsObject.Properties.name -eq "AuthTokenSecret") {
-                if ($secretsCollection -notcontains $appDependencyProbingPath.authTokenSecret) {
-                    $secretsCollection += $appDependencyProbingPath.authTokenSecret
+    if ($getAppDependencySecrets) {
+        # Loop through appDependencyProbingPaths and trustedNuGetFeeds and add secrets to the collection of secrets to get
+        $settingsCollection = @()
+        if ($settings.Keys -contains 'appDependencyProbingPaths') {
+            $settingsCollection += $settings.appDependencyProbingPaths
+        }
+        if ($settings.Keys -contains 'trustedNuGetFeeds') {
+            $settingsCollection += $settings.trustedNuGetFeeds
+        }
+        foreach($settingsItem in $settingsCollection) {
+            if ($settingsItem.PsObject.Properties.name -eq "AuthTokenSecret") {
+                if ($secretsCollection -notcontains $settingsItem.authTokenSecret) {
+                    $secretsCollection += $settingsItem.authTokenSecret
+                }
+            }
+        }
+        # Look through installApps and installTestApps for secrets and add them to the collection of secrets to get
+        foreach($installSettingsKey in @('installApps','installTestApps')) {
+            if ($settings.Keys -contains $installSettingsKey) {
+                $settings."$installSettingsKey" | ForEach-Object {
+                    # If any of the installApps URLs contains '${{SECRETNAME}}' we need to get the secret
+                    $pattern = '.*(\$\{\{\s*([^}]+?)\s*\}\}).*'
+                    if ($_ -match $pattern) {
+                        $secretName = $matches[2]
+                        if ($secretsCollection -notcontains $secretName) {
+                            $secretsCollection += $secretName
+                        }
+                    }
                 }
             }
         }
@@ -76,9 +98,11 @@ try {
     foreach($secret in @($secretsCollection)) {
         $secretSplit = $secret.Split('=')
         $secretsProperty = $secretSplit[0]
-        # Secret names preceded by an asterisk are returned encrypted (and base64 encoded)
-        $secretsPropertyName = $secretsProperty.TrimStart('*')
-        $encrypted = $secretsProperty.StartsWith('*')
+        # Secret names preceded by an asterisk are returned encrypted (and base64 encoded unless...)
+        # Secret names preceded by a minus are not base64 encoded
+        $secretsPropertyName = $secretsProperty.TrimStart('-*')
+        $encrypted = $secretsProperty.TrimStart('-').StartsWith('*')
+        $base64encoded = !($secretsProperty.TrimStart('*').StartsWith('-'))
         $secretName = $secretsPropertyName
         if ($secretSplit.Count -gt 1) {
             $secretName = $secretSplit[1]
@@ -113,10 +137,17 @@ try {
                         }
                     }
                 }
-                $base64value = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($secretValue))
-                $outSecrets += @{ "$secretsProperty" = $base64value }
+                if ($base64encoded) {
+                    Write-Host "Base64 encode secret"
+                    $secretValue = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($secretValue.Trim()))
+                }
+                $outSecrets += @{ "$secretsPropertyName" = $secretValue }
                 Write-Host "$($secretsPropertyName) successfully read from secret $secretName"
                 $secretsCollection.Remove($secret)
+            }
+            elseif ($secretsPropertyName -eq 'gitSubmodulesToken') {
+                Write-Host "Using GitHub token for gitSubmodulesToken"
+                $outSecrets += @{ "$secretsPropertyName" = GetGithubSecret -SecretName 'github_token' }
             }
         }
     }
@@ -125,8 +156,9 @@ try {
         $unresolvedSecrets = ($secretsCollection | ForEach-Object {
             $secretSplit = @($_.Split('='))
             $secretsProperty = $secretSplit[0]
-            # Secret names preceded by an asterisk are returned encrypted (and base64 encoded)
-            $secretsPropertyName = $secretsProperty.TrimStart('*')
+            # Secret names preceded by an asterisk are returned encrypted (and base64 encoded unless...)
+            # Secret names preceded by a minus are not base64 encoded
+            $secretsPropertyName = $secretsProperty.TrimStart('-*')
             if ($secretSplit.Count -eq 1 -or ($secretSplit[1] -eq '')) {
                 $secretsPropertyName
             }
@@ -147,6 +179,7 @@ try {
         if ($useGhTokenWorkflowForPush -eq 'true' -and $outSecrets.ghTokenWorkflow) {
             Write-Host "Use ghTokenWorkflow for Push"
             $ghToken = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($outSecrets.ghTokenWorkflow))
+            $ghToken = GetAccessToken -token $ghToken -permissions @{"actions"="read";"contents"="write";"pull_requests"="write";"metadata"="read";"workflows"="write"}
         }
         else {
             Write-Host "Use github_token for Push"

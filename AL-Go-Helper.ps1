@@ -19,7 +19,7 @@ $defaultCICDPushBranches = @( 'main', 'release/*', 'feature/*' )
 $defaultCICDPullRequestBranches = @( 'main' )
 $runningLocal = $local.IsPresent
 $defaultBcContainerHelperVersion = "latest" # Must be double quotes. Will be replaced by BcContainerHelperVersion if necessary in the deploy step - ex. "https://github.com/organization/navcontainerhelper/archive/refs/heads/branch.zip"
-$notSecretProperties = @("Scopes","TenantId","BlobName","ContainerName","StorageAccountName","ServerUrl","ppUserName")
+$notSecretProperties = @("Scopes","TenantId","BlobName","ContainerName","StorageAccountName","ServerUrl","ppUserName","GitHubAppClientId")
 
 $runAlPipelineOverrides = @(
     "DockerPull"
@@ -41,6 +41,7 @@ $runAlPipelineOverrides = @(
 )
 
 # Well known AppIds
+$platformAppId = "8874ed3a-0643-4247-9ced-7a7002f7135d"
 $systemAppId = "63ca2fa4-4f03-4f2b-a480-172fef340d3f"
 $baseAppId = "437dbf0e-84ff-417a-965d-ed2bb9650972"
 $applicationAppId = "c1335042-3002-4257-bf8a-75c898ccb1b8"
@@ -94,6 +95,23 @@ function Copy-HashTable() {
             }
         }
         $ht
+    }
+}
+
+# Convert SecureString to plain text
+function Get-PlainText {
+    Param(
+        [parameter(ValueFromPipeline, Mandatory = $true)]
+        [System.Security.SecureString] $SecureString
+    )
+    Process {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString);
+        try {
+            return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr);
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeBSTR($bstr);
+        }
     }
 }
 
@@ -182,6 +200,19 @@ function OutputWarning {
     }
     else {
         Write-Host "::Warning::$message"
+    }
+}
+
+function OutputNotice {
+    Param(
+        [string] $message
+    )
+
+    if ($runningLocal) {
+        Write-Host $message
+    }
+    else {
+        Write-Host "::Notice::$message"
     }
 }
 
@@ -326,7 +357,7 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
                 $tempName = Join-Path $bcContainerHelperRootFolder ([Guid]::NewGuid().ToString())
                 $bcContainerHelperVersion = "preview"
                 Write-Host "Download failed, downloading BcContainerHelper $bcContainerHelperVersion version from Blob Storage"
-                $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
+                $webclient.DownloadFile("https://bccontainerhelper-addgd5gzaxf9fneh.b02.azurefd.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
             }
         }
         else {
@@ -336,7 +367,7 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
                 $bcContainerHelperVersion = 'preview'
             }
             Write-Host "Downloading BcContainerHelper $bcContainerHelperVersion version from Blob Storage"
-            $webclient.DownloadFile("https://bccontainerhelper.blob.core.windows.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
+            $webclient.DownloadFile("https://bccontainerhelper-addgd5gzaxf9fneh.b02.azurefd.net/public/$($bcContainerHelperVersion).zip", "$tempName.zip")
         }
         Expand-7zipArchive -Path "$tempName.zip" -DestinationPath $tempName
         $bcContainerHelperPath = (Get-Item -Path (Join-Path $tempName "*\BcContainerHelper.ps1")).FullName
@@ -385,15 +416,21 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
 #
 function DownloadAndImportBcContainerHelper([string] $baseFolder = $ENV:GITHUB_WORKSPACE) {
     $params = @{ "ExportTelemetryFunctions" = $true }
-    $repoSettingsPath = Join-Path $baseFolder $repoSettingsFile
 
     # Default BcContainerHelper Version is hardcoded in AL-Go-Helper (replaced during AL-Go deploy)
     $bcContainerHelperVersion = $defaultBcContainerHelperVersion
+
+    if ("$env:settings" -ne "") {
+        $repoSettingsPath = Join-Path ([System.IO.Path]::GetTempPath()) "$([Guid]::NewGuid().ToString()).json"
+        $env:settings | Set-Content -Path $repoSettingsPath -Encoding UTF8
+    }
+    else {
+        $repoSettingsPath = Join-Path $baseFolder $repoSettingsFile
+    }
     if (Test-Path $repoSettingsPath) {
-        # Read Repository Settings file (without applying organization variables, repository variables or project settings files)
-        # Override default BcContainerHelper version from AL-Go-Helper only if new version is specifically specified in repo settings file
+        # Override default BcContainerHelper version from AL-Go-Helper only if new version is specifically specified in settings
         $repoSettings = Get-Content $repoSettingsPath -Encoding UTF8 | ConvertFrom-Json | ConvertTo-HashTable
-        if ($repoSettings.Keys -contains "BcContainerHelperVersion") {
+        if ($repoSettings.Keys -contains "BcContainerHelperVersion" -and $defaultBcContainerHelperVersion -notlike 'https://*') {
             $bcContainerHelperVersion = $repoSettings.BcContainerHelperVersion
             Write-Host "Using BcContainerHelper $bcContainerHelperVersion version"
             if ($bcContainerHelperVersion -like "https://*") {
@@ -476,7 +513,7 @@ function MergeCustomObjectIntoOrderedDictionary {
                         if ($srcElmType -eq "PSCustomObject") {
                             # Array of objects are not checked for uniqueness
                             $ht = [ordered]@{}
-                            $srcElm.PSObject.Properties | Sort-Object -Property Name -Culture "iv-iv" | ForEach-Object {
+                            $srcElm.PSObject.Properties | Sort-Object -Property Name -Culture ([cultureinfo]::InvariantCulture) | ForEach-Object {
                                 $ht[$_.Name] = $_.Value
                             }
                             $dst."$prop" += @($ht)
@@ -509,11 +546,13 @@ function ReadSettings {
         [string] $baseFolder = "$ENV:GITHUB_WORKSPACE",
         [string] $repoName = "$ENV:GITHUB_REPOSITORY",
         [string] $project = '.',
+        [string] $buildMode = "Default",
         [string] $workflowName = "$ENV:GITHUB_WORKFLOW",
         [string] $userName = "$ENV:GITHUB_ACTOR",
         [string] $branchName = "$ENV:GITHUB_REF_NAME",
         [string] $orgSettingsVariableValue = "$ENV:ALGoOrgSettings",
-        [string] $repoSettingsVariableValue = "$ENV:ALGoRepoSettings"
+        [string] $repoSettingsVariableValue = "$ENV:ALGoRepoSettings",
+        [switch] $silent
     )
 
     # If the build is triggered by a pull request the refname will be the merge branch. To apply conditional settings we need to use the base branch
@@ -528,7 +567,7 @@ function ReadSettings {
 
         if (Test-Path $path) {
             try {
-                Write-Host "Applying settings from $path"
+                if (!$silent.IsPresent) { Write-Host "Applying settings from $path" }
                 $settings = Get-Content $path -Encoding UTF8 | ConvertFrom-Json
                 if ($settings) {
                     return $settings
@@ -539,7 +578,7 @@ function ReadSettings {
             }
         }
         else {
-            Write-Host "No settings found in $path"
+            if (!$silent.IsPresent) { Write-Host "No settings found in $path" }
         }
         return $null
     }
@@ -581,6 +620,8 @@ function ReadSettings {
         "testDependencies"                              = @()
         "testFolders"                                   = @()
         "bcptTestFolders"                               = @()
+        "pageScriptingTests"                            = @()
+        "restoreDatabases"                              = @()
         "installApps"                                   = @()
         "installTestApps"                               = @()
         "installOnlyReferencedApps"                     = $true
@@ -606,6 +647,7 @@ function ReadSettings {
         "doNotBuildTests"                               = $false
         "doNotRunTests"                                 = $false
         "doNotRunBcptTests"                             = $false
+        "doNotRunPageScriptingTests"                    = $false
         "doNotPublishApps"                              = $false
         "doNotSignApps"                                 = $false
         "configPackages"                                = @()
@@ -630,6 +672,13 @@ function ReadSettings {
         "cacheImageName"                                = "my"
         "cacheKeepDays"                                 = 3
         "alwaysBuildAllProjects"                        = $false
+        "incrementalBuilds"                             = [ordered]@{
+            "onPush"                                    = $false
+            "onPull_Request"                            = $true
+            "onSchedule"                                = $false
+            "retentionDays"                             = 30
+            "mode"                                      = "modifiedApps" # modifiedProjects, modifiedApps
+        }
         "microsoftTelemetryConnectionString"            = "InstrumentationKey=cd2cc63e-0f37-4968-b99a-532411a314b8;IngestionEndpoint=https://northeurope-2.in.applicationinsights.azure.com/"
         "partnerTelemetryConnectionString"              = ""
         "sendExtendedTelemetryToMicrosoft"              = $false
@@ -657,6 +706,22 @@ function ReadSettings {
             "defaultIndexMD"                            = "## Reference documentation\n\nThis is the generated reference documentation for [{REPOSITORY}](https://github.com/{REPOSITORY}).\n\nYou can use the navigation bar at the top and the table of contents to the left to navigate your documentation.\n\nYou can change this content by creating/editing the **{INDEXTEMPLATERELATIVEPATH}** file in your repository or use the alDoc:defaultIndexMD setting in your repository settings file (.github/AL-Go-Settings.json)\n\n{RELEASENOTES}"
             "defaultReleaseMD"                          = "## Release reference documentation\n\nThis is the generated reference documentation for [{REPOSITORY}](https://github.com/{REPOSITORY}).\n\nYou can use the navigation bar at the top and the table of contents to the left to navigate your documentation.\n\nYou can change this content by creating/editing the **{INDEXTEMPLATERELATIVEPATH}** file in your repository or use the alDoc:defaultReleaseMD setting in your repository settings file (.github/AL-Go-Settings.json)\n\n{RELEASENOTES}"
         }
+        "trustMicrosoftNuGetFeeds"                      = $true
+        "nuGetFeedSelectMode"                           = "LatestMatching"
+        "commitOptions"                                 = [ordered]@{
+            "messageSuffix"                             = ""
+            "pullRequestAutoMerge"                      = $false
+            "pullRequestLabels"                         = @()
+            "createPullRequest"                         = $true
+        }
+        "trustedSigning"                                = [ordered]@{
+            "Endpoint"                                  = ""
+            "Account"                                   = ""
+            "CertificateProfile"                        = ""
+        }
+        "useGitSubmodules"                              = "false"
+        "gitSubmodulesTokenSecretName"                  = "gitSubmodulesToken"
+        "shortLivedArtifactsRetentionDays"              = 1  # 0 means use GitHub default
     }
 
     # Read settings from files and merge them into the settings object
@@ -701,28 +766,16 @@ function ReadSettings {
                     if ("$conditionalSetting" -ne "") {
                         $conditionMet = $true
                         $conditions = @()
-                        if ($conditionalSetting.PSObject.Properties.Name -eq "branches") {
-                            $conditionMet = $conditionMet -and ($conditionalSetting.branches | Where-Object { $branchName -like $_ })
-                            $conditions += @("branchName: $branchName")
-                        }
-                        if ($conditionalSetting.PSObject.Properties.Name -eq "repositories") {
-                            $conditionMet = $conditionMet -and ($conditionalSetting.repositories | Where-Object { $repoName -like $_ })
-                            $conditions += @("repoName: $repoName")
-                        }
-                        if ($project -and $conditionalSetting.PSObject.Properties.Name -eq "projects") {
-                            $conditionMet = $conditionMet -and ($conditionalSetting.projects | Where-Object { $project -like $_ })
-                            $conditions += @("project: $project")
-                        }
-                        if ($workflowName -and $conditionalSetting.PSObject.Properties.Name -eq "workflows") {
-                            $conditionMet = $conditionMet -and ($conditionalSetting.workflows | Where-Object { $workflowName -like $_ })
-                            $conditions += @("workflowName: $workflowName")
-                        }
-                        if ($userName -and $conditionalSetting.PSObject.Properties.Name -eq "users") {
-                            $conditionMet = $conditionMet -and ($conditionalSetting.users | Where-Object { $userName -like $_ })
-                            $conditions += @("userName: $userName")
+                        @{"buildModes" = $buildMode; "branches" = $branchName; "repositories" = $repoName; "projects" = $project; "workflows" = $workflowName; "users" = $userName}.GetEnumerator() | ForEach-Object {
+                            $propName = $_.Key
+                            $propValue = $_.Value
+                            if ($conditionMet -and $conditionalSetting.PSObject.Properties.Name -eq $propName) {
+                                $conditionMet = $propValue -and $conditionMet -and ($conditionalSetting."$propName" | Where-Object { $propValue -like $_ })
+                                $conditions += @("$($propName): $propValue")
+                            }
                         }
                         if ($conditionMet) {
-                            Write-Host "Applying conditional settings for $($conditions -join ", ")"
+                            if (!$silent.IsPresent) { Write-Host "Applying conditional settings for $($conditions -join ", ")" }
                             MergeCustomObjectIntoOrderedDictionary -dst $settings -src $conditionalSetting.settings
                         }
                     }
@@ -743,7 +796,7 @@ function ReadSettings {
     # At some point in the future (likely version 3.0), we will switch to Ubuntu (Linux) as default for "runs-on"
     #
     if ($settings.shell -eq "") {
-        if ($settings."runs-on" -like "ubuntu-*") {
+        if ($settings."runs-on" -like "*ubuntu-*") {
             $settings.shell = "pwsh"
         }
         else {
@@ -751,7 +804,7 @@ function ReadSettings {
         }
     }
     if ($settings.githubRunner -eq "") {
-        if ($settings."runs-on" -like "ubuntu-*") {
+        if ($settings."runs-on" -like "*ubuntu-*") {
             $settings.githubRunner = "windows-latest"
         }
         else {
@@ -768,6 +821,11 @@ function ReadSettings {
     if ($settings.shell -ne "powershell" -and $settings.shell -ne "pwsh") {
         throw "Invalid value for setting: shell: $($settings.githubRunnerShell)"
     }
+    if (($settings.githubRunner -like "*ubuntu-*") -and ($settings.githubRunnerShell -eq "powershell")) {
+        Write-Host "Switching shell to pwsh for ubuntu"
+        $settings.githubRunnerShell = "pwsh"
+    }
+
     if($settings.projectName -eq '') {
         $settings.projectName = $project # Default to project path as project name
     }
@@ -836,8 +894,8 @@ function ResolveProjectFolders {
                 # Folders are relative to the project folder
                 $appFolder = Resolve-Path -Path $aLProjectFolder.FullName -Relative
                 switch ($true) {
-                    $isTestApp { $testFolders += @($appFolder) }
-                    $isBcptTestApp { $bcptTestFolders += @($appFolder) }
+                    $isBcptTestApp { $bcptTestFolders += @($appFolder); break }
+                    $isTestApp { $testFolders += @($appFolder); break }
                     Default { $appFolders += @($appFolder) }
                 }
             }
@@ -886,11 +944,6 @@ function AnalyzeRepo {
     )
 
     $settings = $settings | Copy-HashTable
-
-    if (!$runningLocal) {
-        Write-Host "::group::Analyzing repository"
-    }
-
     $projectPath = Join-Path $baseFolder $project -Resolve
 
     # Check applicationDependency
@@ -1084,17 +1137,12 @@ function AnalyzeRepo {
             if ($performanceToolkitApps.Contains($dep.id)) { $settings.installPerformanceToolkit = $true }
         }
     }
-
-    if (!$runningLocal) {
-        Write-Host "::endgroup::"
-    }
-
     if (!$settings.doNotRunBcptTests -and -not $settings.bcptTestFolders) {
-        Write-Host "No performance test apps found in bcptTestFolders in $ALGoSettingsFile"
+        if (!$settings.doNotBuildTests) { Write-Host "No performance test apps found in bcptTestFolders in $ALGoSettingsFile" }
         $settings.doNotRunBcptTests = $true
     }
     if (!$settings.doNotRunTests -and -not $settings.testFolders) {
-        if (!$doNotIssueWarnings) { OutputWarning -message "No test apps found in testFolders in $ALGoSettingsFile" }
+        if (-not ($doNotIssueWarnings -or $settings.doNotBuildTests)) { OutputWarning -message "No test apps found in testFolders in $ALGoSettingsFile" }
         $settings.doNotRunTests = $true
     }
     if (-not $settings.appFolders) {
@@ -1301,12 +1349,13 @@ function CloneIntoNewFolder {
     $baseFolder = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
     New-Item $baseFolder -ItemType Directory | Out-Null
     Set-Location $baseFolder
-    $serverUri = [Uri]::new($env:GITHUB_SERVER_URL)
-    $serverUrl = "$($serverUri.Scheme)://$($actor):$($token)@$($serverUri.Host)/$($env:GITHUB_REPOSITORY)"
 
     # Environment variables for hub commands
     $env:GITHUB_USER = $actor
-    $env:GITHUB_TOKEN = $token
+    $env:GITHUB_TOKEN = GetAccessToken -token $token -permissions @{"actions"="read";"metadata"="read";"contents"="write";"pull_requests"="write"}
+
+    $serverUri = [Uri]::new($env:GITHUB_SERVER_URL)
+    $serverUrl = "$($serverUri.Scheme)://$($env:GITHUB_USER):$($env:GITHUB_TOKEN)@$($serverUri.Host)/$($env:GITHUB_REPOSITORY)"
 
     # Configure git
     invoke-git config --global user.email "$actor@users.noreply.github.com"
@@ -1333,15 +1382,30 @@ function CommitFromNewFolder {
         [string] $serverUrl,
         [string] $commitMessage,
         [string] $body = $commitMessage,
-        [string] $branch
+        [string] $branch,
+        [string] $headBranch = $ENV:GITHUB_REF_NAME
     )
 
     invoke-git add *
     $status = invoke-git -returnValue status --porcelain=v1
     if ($status) {
+        $title = $commitMessage
+
+        # Add commit message suffix if specified in settings
+        $settings = ReadSettings
+        if ($settings.commitOptions.messageSuffix) {
+            $commitMessage = "$commitMessage / $($settings.commitOptions.messageSuffix)"
+            $body = "$body`n$($settings.commitOptions.messageSuffix)"
+        }
+
         if ($commitMessage.Length -gt 250) {
             $commitMessage = "$($commitMessage.Substring(0,250))...)"
         }
+
+        if ($title.Length -gt 250) {
+            $title = "$($title.Substring(0,250))...)"
+        }
+
         invoke-git commit --allow-empty -m "$commitMessage"
         $activeBranch = invoke-git -returnValue -silent name-rev --name-only HEAD
         # $branch is the name of the branch to be used when creating a Pull Request
@@ -1361,7 +1425,17 @@ function CommitFromNewFolder {
         }
         invoke-git push -u $serverUrl $branch
         try {
-            invoke-gh pr create --fill --head $branch --repo $env:GITHUB_REPOSITORY --base $ENV:GITHUB_REF_NAME --body "$body"
+            if ($settings.commitOptions.pullRequestLabels) {
+                $labels = "$($settings.commitOptions.pullRequestLabels -join ",")"
+                Write-Host "Adding labels: $labels"
+                invoke-gh pr create --fill --head $branch --repo $env:GITHUB_REPOSITORY --base $headBranch --body "$body" --label $labels
+            } else {
+                invoke-gh pr create --fill --head $branch --repo $env:GITHUB_REPOSITORY --base $headBranch --body "$body"
+            }
+
+            if ($settings.commitOptions.pullRequestAutoMerge) {
+                invoke-gh pr merge --auto --squash --delete-branch
+            }
         }
         catch {
             OutputError("GitHub actions are not allowed to create Pull Requests (see GitHub Organization or Repository Actions Settings). You can create the PR manually by navigating to $($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/tree/$branch")
@@ -2026,11 +2100,11 @@ function CheckAndCreateProjectFolder {
 Function AnalyzeProjectDependencies {
     Param(
         [string] $baseFolder,
-        [string[]] $projects,
-        [ref] $buildAlso,
-        [ref] $projectDependencies
+        [string[]] $projects
     )
 
+    $additionalProjectsToBuild = @{}
+    $projectDependencies = @{}
     $appDependencies = @{}
     Write-Host "Analyzing projects in $baseFolder"
 
@@ -2054,14 +2128,22 @@ Function AnalyzeProjectDependencies {
             Pop-Location
         }
 
-        Write-Host "Folders containing apps are $($folders -join ',' )"
+        OutputMessageAndArray -Message "Folders containing apps" -arrayOfStrings $folders
 
         $unknownDependencies = @()
         $apps = @()
         Sort-AppFoldersByDependencies -appFolders $folders -baseFolder $baseFolder -WarningAction SilentlyContinue -unknownDependencies ([ref]$unknownDependencies) -knownApps ([ref]$apps) | Out-Null
+
+        # If the project is using project dependencies, add the unknown dependencies to the list of dependencies
+        # If not, the unknown dependencies are ignored
+        $dependenciesForProject = @()
+        if ($projectSettings.useProjectDependencies -eq $true) {
+            $dependenciesForProject = @($unknownDependencies | ForEach-Object { $_.Split(':')[0] })
+        }
+
         $appDependencies."$project" = @{
             "apps"         = $apps
-            "dependencies" = @($unknownDependencies | ForEach-Object { $_.Split(':')[0] })
+            "dependencies" = $dependenciesForProject
         }
     }
     # AppDependencies is a hashtable with the following structure
@@ -2096,42 +2178,42 @@ Function AnalyzeProjectDependencies {
                 # Add this project and all projects on which that project has a dependency to the list of dependencies for the current project
                 foreach($depProject in $depProjects) {
                     $foundDependencies += $depProject
-                    if ($projectDependencies.Value.Keys -contains $depProject) {
-                        $foundDependencies += $projectDependencies.value."$depProject"
+                    if ($projectDependencies.Keys -contains $depProject) {
+                        $foundDependencies += $projectDependencies."$depProject"
                     }
                 }
             }
             $foundDependencies = @($foundDependencies | Select-Object -Unique)
             # foundDependencies now contains all projects that the current project has a dependency on
             # Update ref variable projectDependencies for this project
-            if ($projectDependencies.Value.Keys -notcontains $project) {
+            if ($projectDependencies.Keys -notcontains $project) {
                 # Loop through the list of projects for which we already built a dependency list
                 # Update the dependency list for that project if it contains the current project, which might lead to a changed dependency list
                 # This is needed because we are looping through the projects in a any order
-                $keys = @($projectDependencies.value.Keys)
+                $keys = @($projectDependencies.Keys)
                 foreach($key in $keys) {
-                    if ($projectDependencies.value."$key" -contains $project) {
-                        $projectDeps = @( $projectDependencies.value."$key" )
-                        $projectDependencies.value."$key" = @( @($projectDeps + $foundDependencies) | Select-Object -Unique )
-                        if (Compare-Object -ReferenceObject $projectDependencies.value."$key" -differenceObject $projectDeps) {
+                    if ($projectDependencies."$key" -contains $project) {
+                        $projectDeps = @( $projectDependencies."$key" )
+                        $projectDependencies."$key" = @( @($projectDeps + $foundDependencies) | Select-Object -Unique )
+                        if (Compare-Object -ReferenceObject $projectDependencies."$key" -differenceObject $projectDeps) {
                             Write-Host "Add ProjectDependencies $($foundDependencies -join ',') to $key"
                         }
                     }
                 }
                 Write-Host "Set ProjectDependencies for $project to $($foundDependencies -join ',')"
-                $projectDependencies.value."$project" = $foundDependencies
+                $projectDependencies."$project" = $foundDependencies
             }
             if ($foundDependencies) {
                 Write-Host "Found dependencies to projects: $($foundDependencies -join ", ")"
-                # Add project to buildAlso for this dependency to ensure that this project also gets build when the dependency is built
+                # Add project to additionalProjectsToBuild for this dependency to ensure that this project also gets build when the dependency is built
                 foreach($dependency in $foundDependencies) {
-                    if ($buildAlso.value.Keys -contains $dependency) {
-                        if ($buildAlso.value."$dependency" -notcontains $project) {
-                            $buildAlso.value."$dependency" += @( $project )
+                    if ($additionalProjectsToBuild.Keys -contains $dependency) {
+                        if ($additionalProjectsToBuild."$dependency" -notcontains $project) {
+                            $additionalProjectsToBuild."$dependency" += @( $project )
                         }
                     }
                     else {
-                        $buildAlso.value."$dependency" = @( $project )
+                        $additionalProjectsToBuild."$dependency" = @( $project )
                     }
                 }
             }
@@ -2151,7 +2233,11 @@ Function AnalyzeProjectDependencies {
         $no++
     }
 
-    return @($projectsOrder)
+    return [PSCustomObject]@{
+        FullProjectsOrder = $projectsOrder
+        AdditionalProjectsToBuild = $additionalProjectsToBuild
+        ProjectDependencies = $projectDependencies
+    }
 }
 
 function GetBaseFolder {
@@ -2305,6 +2391,7 @@ function RetryCommand {
         try {
             Invoke-Command $Command -ArgumentList $argumentList
             if ($LASTEXITCODE -ne 0) {
+                $host.SetShouldExit(0);
                 throw "Command failed with exit code $LASTEXITCODE"
             }
             break
@@ -2358,6 +2445,34 @@ function GetProjectsFromRepository {
         }
     }
     return @(GetMatchingProjects -projects $projects -selectProjects $selectProjects)
+}
+
+function GetFoldersFromAllProjects {
+    Param(
+        [string] $baseFolder
+    )
+
+    Push-Location $baseFolder
+    try {
+        $settings = ReadSettings -baseFolder $baseFolder
+        $projects = GetProjectsFromRepository -baseFolder $baseFolder -projectsFromSettings $settings.projects
+        $folders = @()
+        foreach($project in $projects) {
+            $projectSettings = ReadSettings -project $project -baseFolder $baseFolder -silent
+            ResolveProjectFolders -baseFolder $baseFolder -project $project -projectSettings ([ref] $projectSettings)
+            $folders += @( @($projectSettings.appFolders) + @($projectSettings.testFolders) + @($projectSettings.bcptTestFolders) | ForEach-Object {
+                $fullPath = Join-Path $baseFolder "$project/$_" -Resolve
+                $relativePath = Resolve-Path -Path $fullPath -Relative
+                # Remove the leading .\ from the relative path
+                return $relativePath.Substring(2)
+            } )
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    return $folders | Select-Object -Unique
+
 }
 
 function GetPackageVersion($packageName) {
@@ -2441,5 +2556,38 @@ function ConnectAz {
     }
     catch {
         throw "Error trying to authenticate to Azure. Error was $($_.Exception.Message)"
+    }
+}
+
+function OutputMessageAndArray {
+    Param(
+        [string] $message,
+        [string[]] $arrayOfStrings
+    )
+    Write-Host "$($message):"
+    if (!$arrayOfStrings) {
+        Write-Host "- None"
+    }
+    else {
+        $arrayOfStrings | ForEach-Object {
+            Write-Host "- $_"
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+Run an executable and check the exit code
+.EXAMPLE
+RunAndCheck git checkout -b xxx
+#>
+function RunAndCheck {
+    $ErrorActionPreference = 'SilentlyContinue'
+    $rest = if ($args.Count -gt 1) { $args[1..($args.Count - 1)] } else { $null }
+    & $args[0] $rest
+    $ErrorActionPreference = 'STOP'
+    if ($LASTEXITCODE -ne 0) {
+        $host.SetShouldExit(0)
+        throw "$($args[0]) $($rest | ForEach-Object { $_ }) failed with exit code $LASTEXITCODE"
     }
 }
