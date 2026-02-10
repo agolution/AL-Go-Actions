@@ -9,6 +9,7 @@ $statusSkipped = " :question:"
 # Returns both a summary part and a failures part
 $mdHelperPath = Join-Path -Path $PSScriptRoot -ChildPath "..\MarkDownHelper.psm1"
 Import-Module $mdHelperPath
+Import-Module (Join-Path $PSScriptRoot '..\TelemetryHelper.psm1' -Resolve)
 
 #Helper function to build a markdown table.
 #Headers are an array of strings with format "label;alignment" where alignment is 'left', 'right' or 'center'
@@ -132,12 +133,14 @@ function GetTestResultSummaryMD {
 
     $summarySb = [System.Text.StringBuilder]::new()
     $failuresSb = [System.Text.StringBuilder]::new()
+    $totalTests = 0
+    $totalTime = 0.0
+    $totalFailed = 0
+    $totalSkipped = 0
+
     if (Test-Path -Path $testResultsFile -PathType Leaf) {
         $testResults = [xml](Get-Content -path $testResultsFile -Encoding UTF8)
-        $totalTests = 0
-        $totalTime = 0.0
-        $totalFailed = 0
-        $totalSkipped = 0
+
         if ($testResults.testsuites) {
             $appNames = @($testResults.testsuites.testsuite | ForEach-Object { $_.Properties.property | Where-Object { $_.Name -eq "appName" } | ForEach-Object { $_.Value } } | Select-Object -Unique)
             if (-not $appNames) {
@@ -217,9 +220,21 @@ function GetTestResultSummaryMD {
         }
     }
     else {
-        $summarySb.Append("<i>No test results found</i>") | Out-Null
         $failuresSummaryMD = ''
     }
+
+    # Log test metrics to telemetry
+    $totalPassed = $totalTests - $totalFailed - $totalSkipped
+    if ($totalTests -gt 0) {
+        $telemetryData = [System.Collections.Generic.Dictionary[[System.String], [System.String]]]::new()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalTests' -Value $totalTests.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalPassed' -Value $totalPassed.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalFailed' -Value $totalFailed.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalSkipped' -Value $totalSkipped.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalTime' -Value $totalTime.ToString()
+        Trace-Information -Message "AL-Go Test Results - Tests" -AdditionalData $telemetryData
+    }
+
     $summarySb.ToString()
     $failuresSb.ToString()
     $failuresSummaryMD
@@ -281,7 +296,7 @@ function GetBcptSummaryMD {
 
     $bcpt = ReadBcptFile -bcptTestResultsFile $bcptTestResultsFile
     if (-not $bcpt) {
-        return '<i>No test results found</i>'
+        return ''
     }
     $baseLine = ReadBcptFile -bcptTestResultsFile $baseLinePath
     if ($baseLine) {
@@ -320,6 +335,10 @@ function GetBcptSummaryMD {
     $lastCodeunitID = ''
     $lastCodeunitName = ''
     $lastOperationName = ''
+
+    $totalPassed = 0
+    $totalFailed = 0
+    $totalSkipped = 0
 
     # calculate statistics on measurements, skipping the $skipMeasurements longest measurements
     foreach($suiteName in $bcpt.Keys) {
@@ -419,6 +438,16 @@ function GetBcptSummaryMD {
                             }
                         }
                         $mdTableRow = @($thisSuiteName, $thisCodeunitID, $thisCodeunitName, $thisOperationName, $statusStr, $durationMinStr, $baseDurationMinStr, $diffDurationMinStr, $diffDurationMinPctStr, $numberOfSQLStmtsStr, $baseNumberOfSQLStmtsStr, $diffNumberOfSQLStmtsStr, $diffNumberOfSQLStmtsPctStr)
+
+                        # Update test counts
+                        if ($statusStr) {
+                            switch ($statusStr) {
+                                $statusOK { $totalPassed++ }
+                                $statusWarning { $totalFailed++ }
+                                $statusError { $totalFailed++ }
+                                $statusSkipped { $totalSkipped++ }
+                            }
+                        }
                     }
                 }
                 $mdTableRows.Add($mdTableRow) | Out-Null
@@ -439,6 +468,17 @@ function GetBcptSummaryMD {
         $summarySb.AppendLine("\n<i>No baseline provided. Copy a set of BCPT results to $([System.IO.Path]::GetFileName($baseLinePath)) in the project folder in order to establish a baseline.</i>") | Out-Null
     }
 
+    # Log BCPT metrics to telemetry
+    $totalTests = $totalPassed + $totalFailed + $totalSkipped
+    if ($totalTests -gt 0) {
+        $telemetryData = [System.Collections.Generic.Dictionary[[System.String], [System.String]]]::new()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalTests' -Value $totalTests.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalPassed' -Value $totalPassed.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalFailed' -Value $totalFailed.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalSkipped' -Value $totalSkipped.ToString()
+        Trace-Information -Message "AL-Go Test Results - BCPT Tests" -AdditionalData $telemetryData
+    }
+
     $summarySb.ToString()
 }
 
@@ -450,13 +490,14 @@ function GetPageScriptingTestResultSummaryMD {
 
     $summarySb = [System.Text.StringBuilder]::new()
     $failuresSb = [System.Text.StringBuilder]::new()
+    $totalTests = 0
+    $totalTime = 0.0
+    $totalFailed = 0
+    $totalSkipped = 0
+    $totalPassed = 0
 
     if (Test-Path -Path $testResultsFile -PathType Leaf) {
         $testResults = [xml](Get-Content -path $testResultsFile -Encoding UTF8)
-        $totalTests = 0
-        $totalTime = 0.0
-        $totalFailed = 0
-        $totalSkipped = 0
 
         $rootFailureNode = [FailureNode]::new($false)
         if ($testResults.testsuites) {
@@ -500,11 +541,11 @@ function GetPageScriptingTestResultSummaryMD {
                             $testCaseFailureNode = [FailureNode]::new($true)
                             $testCaseFailureNode.errorMessage = $testcase.failure.message
                             $testCaseFailureNode.errorStackTrace = $testcase.failure."#cdata-section"
-                            $testCaseSummaryNode.childSummaries.Add($testCaseFailureNode)
-                            $suiteFailureNode.childSummaries.Add($testCaseSummaryNode)
+                            $testCaseSummaryNode.childSummaries.Add($testCaseFailureNode) | Out-Null
+                            $suiteFailureNode.childSummaries.Add($testCaseSummaryNode) | Out-Null
                         }
                     }
-                    $rootFailureNode.childSummaries.Add($suiteFailureNode)
+                    $rootFailureNode.childSummaries.Add($suiteFailureNode) | Out-Null
                 }
             }
             $summarySb = BuildTestMarkdownTable -Headers $mdTableHeaders -Rows $mdTableRows -resultIcons $mdTableEmojis
@@ -521,11 +562,24 @@ function GetPageScriptingTestResultSummaryMD {
         }
     }
     else {
-        $summarySb.Append("<i>No test results found</i>") | Out-Null
+        Write-Host "Did not find test results file"
         $failuresSummaryMD = ''
     }
 
-    $summarySb.ToString()
-    $failuresSb.ToString()
-    $failuresSummaryMD
+    # Log test metrics to telemetry
+    if ($totalTests -gt 0) {
+        $telemetryData = [System.Collections.Generic.Dictionary[[System.String], [System.String]]]::new()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalTests' -Value $totalTests.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalPassed' -Value $totalPassed.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalFailed' -Value $totalFailed.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalSkipped' -Value $totalSkipped.ToString()
+        Add-TelemetryProperty -Hashtable $telemetryData -Key 'TotalTime' -Value $totalTime.ToString()
+        Trace-Information -Message "AL-Go Test Results - Page scripting Tests" -AdditionalData $telemetryData
+    }
+
+    return @{
+        SummaryMD = $summarySb.ToString()
+        FailuresMD = $failuresSb.ToString()
+        FailuresSummaryMD = $failuresSummaryMD
+    }
 }

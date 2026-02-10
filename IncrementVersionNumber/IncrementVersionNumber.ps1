@@ -26,7 +26,7 @@ $settings = $env:Settings | ConvertFrom-Json
 if ($versionNumber.StartsWith('+')) {
     # Handle incremental version number
     $allowedIncrementalVersionNumbers = @('+1', '+0.1')
-    if ($settings.versioningStrategy -eq 3) {
+    if (($settings.versioningStrategy -band 15) -eq 3) {
         # Allow increment build
         $allowedIncrementalVersionNumbers += '+0.0.1'
     }
@@ -38,7 +38,7 @@ else {
     # Handle absolute version number
     $versionNumberFormat = '^\d+\.\d+$' # Major.Minor
     $correctFormatMsg = 'Major.Minor (e.g. 1.0 or 1.2)'
-    if ($settings.versioningStrategy -eq 3) {
+    if (($settings.versioningStrategy -band 15) -eq 3) {
         $versionNumberFormat = '^\d+\.\d+\.\d+$' # Major.Minor.Build
         $correctFormatMsg = 'Major.Minor.Build (e.g. 1.0, 1.2 or 1.2.3)'
     }
@@ -57,8 +57,8 @@ if ($projectList.Count -eq 0 -and $PPprojects.Count -eq 0) {
 $repositorySettingsPath = Join-Path $baseFolder $RepoSettingsFile # $RepoSettingsFile is defined in AL-Go-Helper.ps1
 
 # Increment version number in AL Projects
+$allAppFolders = @()
 if ($projectList.Count -gt 0) {
-    $allAppFolders = @()
     $repoVersionExistsInRepoSettings = Test-SettingExists -settingsFilePath $repositorySettingsPath -settingName 'repoVersion'
     $repoVersionInRepoSettingsWasUpdated = $false
     foreach ($project in $projectList) {
@@ -89,25 +89,13 @@ if ($projectList.Count -gt 0) {
         $projectSettings = ReadSettings -baseFolder $baseFolder -project $project
         ResolveProjectFolders -baseFolder $baseFolder -project $project -projectSettings ([ref] $projectSettings)
 
-        # Set version in app manifests (app.json files)
-        Set-VersionInAppManifests -projectPath $projectPath -projectSettings $projectSettings -newValue $versionNumber
-
-        # Collect all project's app folders
-        $allAppFolders += $projectSettings.appFolders | ForEach-Object { Join-Path $projectPath $_ -Resolve }
-        $allAppFolders += $projectSettings.testFolders | ForEach-Object { Join-Path $projectPath $_ -Resolve }
-        $allAppFolders += $projectSettings.bcptTestFolders | ForEach-Object { Join-Path $projectPath $_ -Resolve }
+        Set-VersionInAppManifests -projectPath $projectPath -projectSettings $projectSettings -newValue $versionNumber -updatedAppFolders ([ref] $allAppFolders)
     }
+}
 
-    if (-not $skipUpdatingDependencies) {
-        # Set dependencies in app manifests
-        if ($allAppFolders.Count -eq 0) {
-            Write-Host "No App folders found for projects $projects"
-        }
-        else {
-            # Set dependencies in app manifests
-            Set-DependenciesVersionInAppManifests -appFolders $allAppFolders
-        }
-    }
+if (-not $skipUpdatingDependencies) {
+    # Set dependencies in app manifests
+    Set-DependenciesVersionInAppManifests -appFolders $allAppFolders
 }
 
 # Increment version number in PowerPlatform Solution

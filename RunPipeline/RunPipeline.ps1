@@ -7,10 +7,10 @@ Param(
     [string] $project = "",
     [Parameter(HelpMessage = "Specifies a mode to use for the build steps", Mandatory = $false)]
     [string] $buildMode = 'Default',
-    [Parameter(HelpMessage = "A JSON-formatted list of apps to install", Mandatory = $false)]
-    [string] $installAppsJson = '[]',
-    [Parameter(HelpMessage = "A JSON-formatted list of test apps to install", Mandatory = $false)]
-    [string] $installTestAppsJson = '[]',
+    [Parameter(HelpMessage = "A path to a JSON-formatted list of apps to install", Mandatory = $false)]
+    [string] $installAppsJson = '',
+    [Parameter(HelpMessage = "A path to a JSON-formatted list of test apps to install", Mandatory = $false)]
+    [string] $installTestAppsJson = '',
     [Parameter(HelpMessage = "RunId of the baseline workflow run", Mandatory = $false)]
     [string] $baselineWorkflowRunId = '0',
     [Parameter(HelpMessage = "SHA of the baseline workflow run", Mandatory = $false)]
@@ -86,7 +86,7 @@ try {
 
     $appBuild = $settings.appBuild
     $appRevision = $settings.appRevision
-    'licenseFileUrl','codeSignCertificateUrl','codeSignCertificatePassword','keyVaultCertificateUrl','*keyVaultCertificatePassword','keyVaultClientId','gitHubPackagesContext','applicationInsightsConnectionString' | ForEach-Object {
+    'licenseFileUrl','codeSignCertificateUrl','codeSignCertificatePassword','keyVaultCertificateUrl','keyVaultCertificatePassword','keyVaultClientId','gitHubPackagesContext','applicationInsightsConnectionString' | ForEach-Object {
         # Secrets might not be read during Pull Request runs
         if ($secrets.Keys -contains $_) {
             $value = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$_"))
@@ -94,9 +94,8 @@ try {
         else {
             $value = ""
         }
-        # Secrets preceded by an asterisk are returned encrypted.
-        # Variable name should not include the asterisk
-        Set-Variable -Name $_.TrimStart('*') -Value $value
+
+        Set-Variable -Name $_ -Value $value
     }
 
     $analyzeRepoParams = @{}
@@ -127,7 +126,6 @@ try {
     $buildArtifactFolder = Join-Path $projectPath ".buildartifacts"
     New-Item $buildArtifactFolder -ItemType Directory | Out-Null
 
-    $downloadedAppsByType = @()
     if ($baselineWorkflowSHA -and $baselineWorkflowRunId -ne '0' -and $settings.incrementalBuilds.mode -eq 'modifiedApps') {
         # Incremental builds are enabled and we are only building modified apps
         try {
@@ -142,7 +140,7 @@ try {
         if (!$buildAll) {
             Write-Host "Get unmodified apps from baseline workflow run"
             # Downloaded apps are placed in the build artifacts folder, which is detected by Run-AlPipeline, meaning only non-downloaded apps are built
-            $downloadedAppsByType = Get-UnmodifiedAppsFromBaselineWorkflowRun `
+            Get-UnmodifiedAppsFromBaselineWorkflowRun `
                 -token $token `
                 -settings $settings `
                 -baseFolder $baseFolder `
@@ -164,7 +162,13 @@ try {
                 }
             }
             else {
-                $trustedNuGetFeed | Add-Member -MemberType NoteProperty -Name 'Token' -Value ''
+                $tokenValue = ''
+                if ($trustedNuGetFeed.url -like 'https://nuget.pkg.github.com/*') {
+                    # GitHub Packages might be public, but they still require a token with read:packages permissions (not necessarily to the specific feed)
+                    # instead of using a blank token, we use the GitHub token (which has read packages permissions) provided to the action
+                    $tokenValue = $token
+                }
+                $trustedNuGetFeed | Add-Member -MemberType NoteProperty -Name 'Token' -Value $tokenValue
             }
             if ($trustedNuGetFeed.PSObject.Properties.Name -eq 'AuthTokenSecret' -and $trustedNuGetFeed.AuthTokenSecret) {
                 $authTokenSecret = $trustedNuGetFeed.AuthTokenSecret
@@ -189,8 +193,31 @@ try {
     }
 
     $install = @{
-        "Apps" = $settings.installApps + @($installAppsJson | ConvertFrom-Json)
-        "TestApps" = $settings.installTestApps + @($installTestAppsJson | ConvertFrom-Json)
+        "Apps" = $settings.installApps
+        "TestApps" = $settings.installTestApps
+    }
+
+    if ($installAppsJson -and (Test-Path $installAppsJson)) {
+        try {
+            $install.Apps += @(Get-Content -Path $installAppsJson -Raw | ConvertFrom-Json)
+        }
+        catch {
+            throw "Failed to parse JSON file at path '$installAppsJson'. Error: $($_.Exception.Message)"
+        }
+    }
+
+    if ($installTestAppsJson -and (Test-Path $installTestAppsJson)) {
+        try {
+            $install.TestApps += @(Get-Content -Path $installTestAppsJson -Raw | ConvertFrom-Json)
+        }
+        catch {
+            throw "Failed to parse JSON file at path '$installTestAppsJson'. Error: $($_.Exception.Message)"
+        }
+    }
+
+    if ($settings.runTestsInAllInstalledTestApps) {
+        # Trim parentheses from test apps. Run-ALPipeline will skip running tests in test apps wrapped in ()
+        $install.TestApps = $install.TestApps | ForEach-Object { $_.TrimStart("(").TrimEnd(")") }
     }
 
     # Replace secret names in install.apps and install.testApps
@@ -221,6 +248,7 @@ try {
 
     # Analyze InstallApps and InstallTestApps before launching pipeline
 
+
     # Check if codeSignCertificateUrl+Password is used (and defined)
     if (!$settings.doNotSignApps -and $codeSignCertificateUrl -and $codeSignCertificatePassword -and !$settings.keyVaultCodesignCertificateName) {
         OutputWarning -message "Using the legacy CodeSignCertificateUrl and CodeSignCertificatePassword parameters. Consider using the new Azure Keyvault signing instead. Go to https://aka.ms/ALGoSettings#keyVaultCodesignCertificateName to find out more"
@@ -236,6 +264,8 @@ try {
     }
 
     if ($keyVaultCertificateUrl -and $keyVaultCertificatePassword -and $keyVaultClientId) {
+        Trace-Information -Message "Enabling key vault access for apps"
+
         $runAlPipelineParams += @{
             "KeyVaultCertPfxFile" = $keyVaultCertificateUrl
             "keyVaultCertPfxPassword" = ConvertTo-SecureString -string $keyVaultCertificatePassword
@@ -247,7 +277,8 @@ try {
     if (!$settings.skipUpgrade) {
         Write-Host "::group::Locating previous release"
         try {
-            $latestRelease = GetLatestRelease -token $token -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY -ref $ENV:GITHUB_REF_NAME
+            $branchForRelease = if ($ENV:GITHUB_BASE_REF) { $ENV:GITHUB_BASE_REF } else { $ENV:GITHUB_REF_NAME }
+            $latestRelease = GetLatestRelease -token $token -api_url $ENV:GITHUB_API_URL -repository $ENV:GITHUB_REPOSITORY -ref $branchForRelease
             if ($latestRelease) {
                 Write-Host "Using $($latestRelease.name) (tag $($latestRelease.tag_name)) as previous release"
                 $artifactsFolder = Join-Path $baseFolder "artifacts"
@@ -292,8 +323,18 @@ try {
         $appRevision = $artifactVersion.Revision
     }
     elseif (($settings.versioningStrategy -band 16) -eq 16) {
+        # For versioningStrategy +16, the version number is taken from repoVersion setting
+        $repoVersion = [System.Version]$settings.repoVersion
+        if (($settings.versioningStrategy -band 15) -eq 3) {
+            # For versioning strategy 3, we need to get the build number from repoVersion setting
+            $appBuild = $repoVersion.Build
+            if ($appBuild -eq -1) {
+                Write-Warning "RepoVersion setting only contains Major.Minor version. When using versioningStrategy 3, it should contain 3 digits"
+                $appBuild = 0
+            }
+        }
         $runAlPipelineParams += @{
-            "appVersion" = $settings.repoVersion
+            "appVersion" = "$($repoVersion.Major).$($repoVersion.Minor)"
         }
     }
 
@@ -451,7 +492,8 @@ try {
     "enablePerTenantExtensionCop",
     "enableUICop",
     "enableCodeAnalyzersOnTestApps",
-    "useCompilerFolder" | ForEach-Object {
+    "useCompilerFolder",
+    "reportSuppressedDiagnostics" | ForEach-Object {
         if ($settings."$_") { $runAlPipelineParams += @{ "$_" = $true } }
     }
 
@@ -466,14 +508,6 @@ try {
     if ($runAlPipelineParams.Keys -notcontains 'preprocessorsymbols') {
         $runAlPipelineParams["preprocessorsymbols"] = @()
     }
-
-    # DEPRECATION: REMOVE AFTER April 1st 2025 --->
-    if ($buildMode -eq 'Clean' -and $settings.ContainsKey('cleanModePreprocessorSymbols')) {
-        Write-Host "Adding Preprocessor symbols : $($settings.cleanModePreprocessorSymbols -join ',')"
-        $runAlPipelineParams["preprocessorsymbols"] += $settings.cleanModePreprocessorSymbols
-        Trace-DeprecationWarning -Message "cleanModePreprocessorSymbols is deprecated" -DeprecationTag "cleanModePreprocessorSymbols"
-    }
-    # <--- REMOVE AFTER April 1st 2025
 
     if ($settings.ContainsKey('preprocessorSymbols')) {
         Write-Host "Adding Preprocessor symbols : $($settings.preprocessorSymbols -join ',')"
@@ -515,6 +549,7 @@ try {
         -failOn $settings.failOn `
         -treatTestFailuresAsWarnings:$settings.treatTestFailuresAsWarnings `
         -rulesetFile $settings.rulesetFile `
+        -generateErrorLog:$settings.trackALAlertsInGitHub `
         -enableExternalRulesets:$settings.enableExternalRulesets `
         -appSourceCopMandatoryAffixes $settings.appSourceCopMandatoryAffixes `
         -additionalCountries $additionalCountries `
@@ -536,6 +571,16 @@ try {
         Copy-Item -Path $buildOutputFile -Destination $destFolder -Force -ErrorAction SilentlyContinue
         Copy-Item -Path $containerEventLogFile -Destination $destFolder -Force -ErrorAction SilentlyContinue
     }
+
+    # check for new warnings
+    Import-Module (Join-Path $PSScriptRoot ".\CheckForWarningsUtils.psm1" -Resolve) -DisableNameChecking
+
+    Test-ForNewWarnings -token $token `
+        -project $project `
+        -settings $settings `
+        -buildMode $buildMode `
+        -baselineWorkflowRunId $baselineWorkflowRunId `
+        -prBuildOutputFile $buildOutputFile
 }
 catch {
     throw

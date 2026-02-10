@@ -3,9 +3,19 @@ Param(
 )
 
 $gitHubHelperPath = Join-Path $PSScriptRoot 'Github-Helper.psm1'
+$readSettingsModule = Join-Path $PSScriptRoot '.Modules/ReadSettings.psm1'
+$debugLoggingModule = Join-Path $PSScriptRoot '.Modules/DebugLogHelper.psm1'
 if (Test-Path $gitHubHelperPath) {
     Import-Module $gitHubHelperPath
     # If we are adding more dependencies here, then localDevEnv and cloudDevEnv needs to be updated
+}
+
+if (Test-Path $readSettingsModule) {
+    Import-Module $readSettingsModule
+}
+
+if (Test-Path $debugLoggingModule) {
+    Import-Module $debugLoggingModule
 }
 
 $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
@@ -17,9 +27,8 @@ $RepoSettingsFile = Join-Path '.github' 'AL-Go-Settings.json'
 $defaultCICDPushBranches = @( 'main', 'release/*', 'feature/*' )
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'defaultCICDPullRequestBranches', Justification = 'False positive.')]
 $defaultCICDPullRequestBranches = @( 'main' )
-$runningLocal = $local.IsPresent
 $defaultBcContainerHelperVersion = "latest" # Must be double quotes. Will be replaced by BcContainerHelperVersion if necessary in the deploy step - ex. "https://github.com/organization/navcontainerhelper/archive/refs/heads/branch.zip"
-$notSecretProperties = @("Scopes","TenantId","BlobName","ContainerName","StorageAccountName","ServerUrl","ppUserName","GitHubAppClientId")
+$notSecretProperties = @("Scopes","TenantId","BlobName","ContainerName","StorageAccountName","ServerUrl","ppUserName","GitHubAppClientId","EnvironmentName")
 
 $runAlPipelineOverrides = @(
     "DockerPull"
@@ -38,6 +47,8 @@ $runAlPipelineOverrides = @(
     "InstallMissingDependencies"
     "PreCompileApp"
     "PostCompileApp"
+    "PipelineInitialize"
+    "PipelineFinalize"
 )
 
 # Well known AppIds
@@ -176,69 +187,6 @@ function ConvertTo-HashTable() {
     }
 }
 
-function OutputError {
-    Param(
-        [string] $message
-    )
-
-    if ($runningLocal) {
-        throw $message
-    }
-    else {
-        Write-Host "::Error::$($message.Replace("`r",'').Replace("`n",' '))"
-        $host.SetShouldExit(1)
-    }
-}
-
-function OutputWarning {
-    Param(
-        [string] $message
-    )
-
-    if ($runningLocal) {
-        Write-Host -ForegroundColor Yellow "WARNING: $message"
-    }
-    else {
-        Write-Host "::Warning::$message"
-    }
-}
-
-function OutputNotice {
-    Param(
-        [string] $message
-    )
-
-    if ($runningLocal) {
-        Write-Host $message
-    }
-    else {
-        Write-Host "::Notice::$message"
-    }
-}
-
-function MaskValueInLog {
-    Param(
-        [string] $value
-    )
-
-    if (!$runningLocal) {
-        Write-Host "`r::add-mask::$value"
-    }
-}
-
-function OutputDebug {
-    Param(
-        [string] $message
-    )
-
-    if ($runningLocal) {
-        Write-Host $message
-    }
-    else {
-        Write-Host "::Debug::$message"
-    }
-}
-
 function GetUniqueFolderName {
     Param(
         [string] $baseFolder,
@@ -348,7 +296,7 @@ function GetBcContainerHelperPath([string] $bcContainerHelperVersion) {
         $webclient = New-Object System.Net.WebClient
         if ($bcContainerHelperVersion -like "https://*") {
             # Use temp space for private versions
-            $tempName = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
+            $tempName = Join-Path (GetTemporaryPath) ([Guid]::NewGuid().ToString())
             Write-Host "Downloading BcContainerHelper developer version from $bcContainerHelperVersion"
             try {
                 $webclient.DownloadFile($bcContainerHelperVersion, "$tempName.zip")
@@ -420,9 +368,9 @@ function DownloadAndImportBcContainerHelper([string] $baseFolder = $ENV:GITHUB_W
     # Default BcContainerHelper Version is hardcoded in AL-Go-Helper (replaced during AL-Go deploy)
     $bcContainerHelperVersion = $defaultBcContainerHelperVersion
 
-    if ("$env:settings" -ne "") {
-        $repoSettingsPath = Join-Path ([System.IO.Path]::GetTempPath()) "$([Guid]::NewGuid().ToString()).json"
-        $env:settings | Set-Content -Path $repoSettingsPath -Encoding UTF8
+    if ("$env:Settings" -ne "") {
+        $repoSettingsPath = Join-Path (GetTemporaryPath) "$([Guid]::NewGuid().ToString()).json"
+        $env:Settings | Set-Content -Path $repoSettingsPath -Encoding UTF8
     }
     else {
         $repoSettingsPath = Join-Path $baseFolder $repoSettingsFile
@@ -455,381 +403,6 @@ function DownloadAndImportBcContainerHelper([string] $baseFolder = $ENV:GITHUB_W
 
     Write-Host "Import from $bcContainerHelperPath"
     . $bcContainerHelperPath @params
-}
-
-function MergeCustomObjectIntoOrderedDictionary {
-    Param(
-        [System.Collections.Specialized.OrderedDictionary] $dst,
-        [PSCustomObject] $src
-    )
-
-    # Loop through all properties in the source object
-    # If the property does not exist in the destination object, add it with the right type, but no value
-    # Types supported: PSCustomObject, Object[] and simple types
-    $src.PSObject.Properties.GetEnumerator() | ForEach-Object {
-        $prop = $_.Name
-        $srcProp = $src."$prop"
-        $srcPropType = $srcProp.GetType().Name
-        if (-not $dst.Contains($prop)) {
-            if ($srcPropType -eq "PSCustomObject") {
-                $dst.Add("$prop", [ordered]@{})
-            }
-            elseif ($srcPropType -eq "Object[]") {
-                $dst.Add("$prop", @())
-            }
-            else {
-                $dst.Add("$prop", $srcProp)
-            }
-        }
-    }
-
-    # Loop through all properties in the destination object
-    # If the property does not exist in the source object, do nothing
-    # If the property exists in the source object, but is of a different type, throw an error
-    # If the property exists in the source object:
-    # If the property is an Object, call this function recursively to merge values
-    # If the property is an Object[], merge the arrays
-    # If the property is a simple type, replace the value in the destination object with the value from the source object
-    @($dst.Keys) | ForEach-Object {
-        $prop = $_
-        if ($src.PSObject.Properties.Name -eq $prop) {
-            $dstProp = $dst."$prop"
-            $srcProp = $src."$prop"
-            $dstPropType = $dstProp.GetType().Name
-            $srcPropType = $srcProp.GetType().Name
-            if ($srcPropType -eq "PSCustomObject" -and $dstPropType -eq "OrderedDictionary") {
-                MergeCustomObjectIntoOrderedDictionary -dst $dst."$prop" -src $srcProp
-            }
-            elseif ($dstPropType -ne $srcPropType -and !($srcPropType -eq "Int64" -and $dstPropType -eq "Int32")) {
-                # Under Linux, the Int fields read from the .json file will be Int64, while the settings defaults will be Int32
-                # This is not seen as an error and will not throw an error
-                throw "property $prop should be of type $dstPropType, is $srcPropType."
-            }
-            else {
-                if ($srcProp -is [Object[]]) {
-                    $srcProp | ForEach-Object {
-                        $srcElm = $_
-                        $srcElmType = $srcElm.GetType().Name
-                        if ($srcElmType -eq "PSCustomObject") {
-                            # Array of objects are not checked for uniqueness
-                            $ht = [ordered]@{}
-                            $srcElm.PSObject.Properties | Sort-Object -Property Name -Culture ([cultureinfo]::InvariantCulture) | ForEach-Object {
-                                $ht[$_.Name] = $_.Value
-                            }
-                            $dst."$prop" += @($ht)
-                        }
-                        else {
-                            # Add source element to destination array, but only if it does not already exist
-                            $dst."$prop" = @($dst."$prop" + $srcElm | Select-Object -Unique)
-                        }
-                    }
-                }
-                else {
-                    $dst."$prop" = $srcProp
-                }
-            }
-        }
-    }
-}
-
-# Read settings from the settings files
-# Settings are read from the following files:
-# - ALGoOrgSettings (github Variable)                 = Organization settings variable
-# - .github/AL-Go-Settings.json                       = Repository Settings file
-# - ALGoRepoSettings (github Variable)                = Repository settings variable
-# - <project>/.AL-Go/settings.json                    = Project settings file
-# - .github/<workflowName>.settings.json              = Workflow settings file
-# - <project>/.AL-Go/<workflowName>.settings.json     = Project workflow settings file
-# - <project>/.AL-Go/<userName>.settings.json         = User settings file
-function ReadSettings {
-    Param(
-        [string] $baseFolder = "$ENV:GITHUB_WORKSPACE",
-        [string] $repoName = "$ENV:GITHUB_REPOSITORY",
-        [string] $project = '.',
-        [string] $buildMode = "Default",
-        [string] $workflowName = "$ENV:GITHUB_WORKFLOW",
-        [string] $userName = "$ENV:GITHUB_ACTOR",
-        [string] $branchName = "$ENV:GITHUB_REF_NAME",
-        [string] $orgSettingsVariableValue = "$ENV:ALGoOrgSettings",
-        [string] $repoSettingsVariableValue = "$ENV:ALGoRepoSettings",
-        [switch] $silent
-    )
-
-    # If the build is triggered by a pull request the refname will be the merge branch. To apply conditional settings we need to use the base branch
-    if (($env:GITHUB_EVENT_NAME -eq "pull_request") -and ($branchName -eq $ENV:GITHUB_REF_NAME)) {
-        $branchName = $env:GITHUB_BASE_REF
-    }
-
-    function GetSettingsObject {
-        Param(
-            [string] $path
-        )
-
-        if (Test-Path $path) {
-            try {
-                if (!$silent.IsPresent) { Write-Host "Applying settings from $path" }
-                $settings = Get-Content $path -Encoding UTF8 | ConvertFrom-Json
-                if ($settings) {
-                    return $settings
-                }
-            }
-            catch {
-                throw "Error reading $path. Error was $($_.Exception.Message).`n$($_.ScriptStackTrace)"
-            }
-        }
-        else {
-            if (!$silent.IsPresent) { Write-Host "No settings found in $path" }
-        }
-        return $null
-    }
-
-    $repoName = $repoName.SubString("$repoName".LastIndexOf('/') + 1)
-    $githubFolder = Join-Path $baseFolder ".github"
-    $workflowName = $workflowName.Trim().Split([System.IO.Path]::getInvalidFileNameChars()) -join ""
-
-    # Start with default settings
-    $settings = [ordered]@{
-        "type"                                          = "PTE"
-        "unusedALGoSystemFiles"                         = @()
-        "projects"                                      = @()
-        "powerPlatformSolutionFolder"                   = ""
-        "country"                                       = "us"
-        "artifact"                                      = ""
-        "companyName"                                   = ""
-        "repoVersion"                                   = "1.0"
-        "repoName"                                      = $repoName
-        "versioningStrategy"                            = 0
-        "runNumberOffset"                               = 0
-        "appBuild"                                      = 0
-        "appRevision"                                   = 0
-        "keyVaultName"                                  = ""
-        "licenseFileUrlSecretName"                      = "licenseFileUrl"
-        "ghTokenWorkflowSecretName"                     = "ghTokenWorkflow"
-        "adminCenterApiCredentialsSecretName"           = "adminCenterApiCredentials"
-        "applicationInsightsConnectionStringSecretName" = "applicationInsightsConnectionString"
-        "keyVaultCertificateUrlSecretName"              = ""
-        "keyVaultCertificatePasswordSecretName"         = ""
-        "keyVaultClientIdSecretName"                    = ""
-        "keyVaultCodesignCertificateName"               = ""
-        "codeSignCertificateUrlSecretName"              = "codeSignCertificateUrl"
-        "codeSignCertificatePasswordSecretName"         = "codeSignCertificatePassword"
-        "additionalCountries"                           = @()
-        "appDependencies"                               = @()
-        "projectName"                                   = ""
-        "appFolders"                                    = @()
-        "testDependencies"                              = @()
-        "testFolders"                                   = @()
-        "bcptTestFolders"                               = @()
-        "pageScriptingTests"                            = @()
-        "restoreDatabases"                              = @()
-        "installApps"                                   = @()
-        "installTestApps"                               = @()
-        "installOnlyReferencedApps"                     = $true
-        "generateDependencyArtifact"                    = $false
-        "skipUpgrade"                                   = $false
-        "applicationDependency"                         = "18.0.0.0"
-        "updateDependencies"                            = $false
-        "installTestRunner"                             = $false
-        "installTestFramework"                          = $false
-        "installTestLibraries"                          = $false
-        "installPerformanceToolkit"                     = $false
-        "enableCodeCop"                                 = $false
-        "enableUICop"                                   = $false
-        "enableCodeAnalyzersOnTestApps"                 = $false
-        "customCodeCops"                                = @()
-        "failOn"                                        = "error"
-        "treatTestFailuresAsWarnings"                   = $false
-        "rulesetFile"                                   = ""
-        "enableExternalRulesets"                        = $false
-        "vsixFile"                                      = ""
-        "assignPremiumPlan"                             = $false
-        "enableTaskScheduler"                           = $false
-        "doNotBuildTests"                               = $false
-        "doNotRunTests"                                 = $false
-        "doNotRunBcptTests"                             = $false
-        "doNotRunPageScriptingTests"                    = $false
-        "doNotPublishApps"                              = $false
-        "doNotSignApps"                                 = $false
-        "configPackages"                                = @()
-        "appSourceCopMandatoryAffixes"                  = @()
-        "deliverToAppSource"                            = [ordered]@{
-            "mainAppFolder"                             = ""
-            "productId"                                 = ""
-            "includeDependencies"                       = @()
-            "continuousDelivery"                        = $false
-        }
-        "obsoleteTagMinAllowedMajorMinor"               = ""
-        "memoryLimit"                                   = ""
-        "templateUrl"                                   = ""
-        "templateSha"                                   = ""
-        "templateBranch"                                = ""
-        "appDependencyProbingPaths"                     = @()
-        "useProjectDependencies"                        = $false
-        "runs-on"                                       = "windows-latest"
-        "shell"                                         = ""
-        "githubRunner"                                  = ""
-        "githubRunnerShell"                             = ""
-        "cacheImageName"                                = "my"
-        "cacheKeepDays"                                 = 3
-        "alwaysBuildAllProjects"                        = $false
-        "incrementalBuilds"                             = [ordered]@{
-            "onPush"                                    = $false
-            "onPull_Request"                            = $true
-            "onSchedule"                                = $false
-            "retentionDays"                             = 30
-            "mode"                                      = "modifiedApps" # modifiedProjects, modifiedApps
-        }
-        "microsoftTelemetryConnectionString"            = "InstrumentationKey=cd2cc63e-0f37-4968-b99a-532411a314b8;IngestionEndpoint=https://northeurope-2.in.applicationinsights.azure.com/"
-        "partnerTelemetryConnectionString"              = ""
-        "sendExtendedTelemetryToMicrosoft"              = $false
-        "environments"                                  = @()
-        "buildModes"                                    = @()
-        "useCompilerFolder"                             = $false
-        "pullRequestTrigger"                            = "pull_request_target"
-        "bcptThresholds"                                = [ordered]@{
-            "DurationWarning"                           = 10
-            "DurationError"                             = 25
-            "NumberOfSqlStmtsWarning"                   = 5
-            "NumberOfSqlStmtsError"                     = 10
-        }
-        "fullBuildPatterns"                             = @()
-        "excludeEnvironments"                           = @()
-        "alDoc"                                         = [ordered]@{
-            "continuousDeployment"                      = $false
-            "deployToGitHubPages"                       = $true
-            "maxReleases"                               = 3
-            "groupByProject"                            = $true
-            "includeProjects"                           = @()
-            "excludeProjects"                           = @()
-            "header"                                    = "Documentation for {REPOSITORY} {VERSION}"
-            "footer"                                    = "Documentation for <a href=""https://github.com/{REPOSITORY}"">{REPOSITORY}</a> made with <a href=""https://aka.ms/AL-Go"">AL-Go for GitHub</a>, <a href=""https://go.microsoft.com/fwlink/?linkid=2247728"">ALDoc</a> and <a href=""https://dotnet.github.io/docfx"">DocFx</a>"
-            "defaultIndexMD"                            = "## Reference documentation\n\nThis is the generated reference documentation for [{REPOSITORY}](https://github.com/{REPOSITORY}).\n\nYou can use the navigation bar at the top and the table of contents to the left to navigate your documentation.\n\nYou can change this content by creating/editing the **{INDEXTEMPLATERELATIVEPATH}** file in your repository or use the alDoc:defaultIndexMD setting in your repository settings file (.github/AL-Go-Settings.json)\n\n{RELEASENOTES}"
-            "defaultReleaseMD"                          = "## Release reference documentation\n\nThis is the generated reference documentation for [{REPOSITORY}](https://github.com/{REPOSITORY}).\n\nYou can use the navigation bar at the top and the table of contents to the left to navigate your documentation.\n\nYou can change this content by creating/editing the **{INDEXTEMPLATERELATIVEPATH}** file in your repository or use the alDoc:defaultReleaseMD setting in your repository settings file (.github/AL-Go-Settings.json)\n\n{RELEASENOTES}"
-        }
-        "trustMicrosoftNuGetFeeds"                      = $true
-        "nuGetFeedSelectMode"                           = "LatestMatching"
-        "commitOptions"                                 = [ordered]@{
-            "messageSuffix"                             = ""
-            "pullRequestAutoMerge"                      = $false
-            "pullRequestLabels"                         = @()
-            "createPullRequest"                         = $true
-        }
-        "trustedSigning"                                = [ordered]@{
-            "Endpoint"                                  = ""
-            "Account"                                   = ""
-            "CertificateProfile"                        = ""
-        }
-        "useGitSubmodules"                              = "false"
-        "gitSubmodulesTokenSecretName"                  = "gitSubmodulesToken"
-        "shortLivedArtifactsRetentionDays"              = 1  # 0 means use GitHub default
-    }
-
-    # Read settings from files and merge them into the settings object
-
-    $settingsObjects = @()
-    # Read settings from organization settings variable (parameter)
-    if ($orgSettingsVariableValue) {
-        $orgSettingsVariableObject = $orgSettingsVariableValue | ConvertFrom-Json
-        $settingsObjects += @($orgSettingsVariableObject)
-    }
-    # Read settings from repository settings file
-    $repoSettingsObject = GetSettingsObject -Path (Join-Path $baseFolder $RepoSettingsFile)
-    $settingsObjects += @($repoSettingsObject)
-    # Read settings from repository settings variable (parameter)
-    if ($repoSettingsVariableValue) {
-        $repoSettingsVariableObject = $repoSettingsVariableValue | ConvertFrom-Json
-        $settingsObjects += @($repoSettingsVariableObject)
-    }
-    if ($project) {
-        # Read settings from project settings file
-        $projectFolder = Join-Path $baseFolder $project -Resolve
-        $projectSettingsObject = GetSettingsObject -Path (Join-Path $projectFolder $ALGoSettingsFile)
-        $settingsObjects += @($projectSettingsObject)
-    }
-    if ($workflowName) {
-        # Read settings from workflow settings file
-        $workflowSettingsObject = GetSettingsObject -Path (Join-Path $gitHubFolder "$workflowName.settings.json")
-        $settingsObjects += @($workflowSettingsObject)
-        if ($project) {
-            # Read settings from project workflow settings file
-            $projectWorkflowSettingsObject = GetSettingsObject -Path (Join-Path $projectFolder "$ALGoFolderName/$workflowName.settings.json")
-            # Read settings from user settings file
-            $userSettingsObject = GetSettingsObject -Path (Join-Path $projectFolder "$ALGoFolderName/$userName.settings.json")
-            $settingsObjects += @($projectWorkflowSettingsObject, $userSettingsObject)
-        }
-    }
-    foreach($settingsJson in $settingsObjects) {
-        if ($settingsJson) {
-            MergeCustomObjectIntoOrderedDictionary -dst $settings -src $settingsJson
-            if ($settingsJson.PSObject.Properties.Name -eq "ConditionalSettings") {
-                foreach($conditionalSetting in $settingsJson.ConditionalSettings) {
-                    if ("$conditionalSetting" -ne "") {
-                        $conditionMet = $true
-                        $conditions = @()
-                        @{"buildModes" = $buildMode; "branches" = $branchName; "repositories" = $repoName; "projects" = $project; "workflows" = $workflowName; "users" = $userName}.GetEnumerator() | ForEach-Object {
-                            $propName = $_.Key
-                            $propValue = $_.Value
-                            if ($conditionMet -and $conditionalSetting.PSObject.Properties.Name -eq $propName) {
-                                $conditionMet = $propValue -and $conditionMet -and ($conditionalSetting."$propName" | Where-Object { $propValue -like $_ })
-                                $conditions += @("$($propName): $propValue")
-                            }
-                        }
-                        if ($conditionMet) {
-                            if (!$silent.IsPresent) { Write-Host "Applying conditional settings for $($conditions -join ", ")" }
-                            MergeCustomObjectIntoOrderedDictionary -dst $settings -src $conditionalSetting.settings
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    # runs-on is used for all jobs except for the build job (basically all jobs which doesn't need a container)
-    # gitHubRunner is used for the build job (or basically all jobs that needs a container)
-    #
-    # shell defaults to "powershell" unless runs-on is Ubuntu (Linux), then it defaults to pwsh
-    #
-    # gitHubRunner defaults to "runs-on", unless runs-on is Ubuntu (Linux) as this won't work.
-    # gitHubRunnerShell defaults to "shell"
-    #
-    # The exception for keeping gitHubRunner to Windows-Latest (when set to Ubuntu-*) will be removed when all jobs supports Ubuntu (Linux)
-    # At some point in the future (likely version 3.0), we will switch to Ubuntu (Linux) as default for "runs-on"
-    #
-    if ($settings.shell -eq "") {
-        if ($settings."runs-on" -like "*ubuntu-*") {
-            $settings.shell = "pwsh"
-        }
-        else {
-            $settings.shell = "powershell"
-        }
-    }
-    if ($settings.githubRunner -eq "") {
-        if ($settings."runs-on" -like "*ubuntu-*") {
-            $settings.githubRunner = "windows-latest"
-        }
-        else {
-            $settings.githubRunner = $settings."runs-on"
-        }
-    }
-    if ($settings.githubRunnerShell -eq "") {
-        $settings.githubRunnerShell = $settings.shell
-    }
-    # Check that gitHubRunnerShell and Shell is valid
-    if ($settings.githubRunnerShell -ne "powershell" -and $settings.githubRunnerShell -ne "pwsh") {
-        throw "Invalid value for setting: gitHubRunnerShell: $($settings.githubRunnerShell)"
-    }
-    if ($settings.shell -ne "powershell" -and $settings.shell -ne "pwsh") {
-        throw "Invalid value for setting: shell: $($settings.githubRunnerShell)"
-    }
-    if (($settings.githubRunner -like "*ubuntu-*") -and ($settings.githubRunnerShell -eq "powershell")) {
-        Write-Host "Switching shell to pwsh for ubuntu"
-        $settings.githubRunnerShell = "pwsh"
-    }
-
-    if($settings.projectName -eq '') {
-        $settings.projectName = $project # Default to project path as project name
-    }
-    $settings
 }
 
 function ExcludeUnneededApps {
@@ -1214,6 +787,13 @@ function CheckAppDependencyProbingPaths {
                 }
                 else {
                     Write-Host "No token available, will attempt to invoke gh auth token for access to repository"
+                    try {
+                        $token = invoke-gh -silent -returnValue auth token
+                    }
+                    catch {
+                        Write-Host "Unable to get token from gh, will attempt to access repository without token. Message: $($_.Exception.Message)"
+                        $token = $null
+                    }
                 }
                 $dependency | Add-Member -name "AuthTokenSecret" -MemberType NoteProperty -Value $token
             }
@@ -1251,12 +831,12 @@ function CheckAppDependencyProbingPaths {
                                 foreach($propertyName in "appFolders", "testFolders", "bcptTestFolders") {
                                     Write-Host "Adding folders from $depProject to $propertyName in $project"
                                     $found = $false
-                                    foreach($_ in $depSettings."$propertyName") {
-                                        $folder = Resolve-Path -Path (Join-Path $baseFolder "$depProject/$_") -Relative
-                                        if (!$settings."$propertyName".Contains($folder)) {
-                                            $settings."$propertyName" += @($folder)
+                                    foreach($folder in $depSettings."$propertyName") {
+                                        $relativeFolderPath = Resolve-Path -Path (Join-Path $baseFolder "$depProject/$folder") -Relative
+                                        if (!$settings."$propertyName".Contains($relativeFolderPath)) {
+                                            $settings."$propertyName" += @($relativeFolderPath)
                                             $found = $true
-                                            Write-Host "- $folder"
+                                            Write-Host "- $relativeFolderPath"
                                         }
                                     }
                                     if (!$found) { Write-Host "- No folders added" }
@@ -1337,6 +917,30 @@ function InstallModule {
     Import-Module -Name $name -MinimumVersion $minimumVersion -DisableNameChecking -WarningAction SilentlyContinue | Out-Null
 }
 
+<#
+    Function to get the temporary path.
+    In the context of GitHub Actions, it uses the RUNNER_TEMP environment variable if available. This directory is emptied at the beginning and end of each job.
+    Otherwise, it falls back to the system's default temporary path.
+#>
+function GetTemporaryPath {
+    if ($env:RUNNER_TEMP) {
+        return $env:RUNNER_TEMP
+    } else {
+        return ([System.IO.Path]::GetTempPath())
+    }
+}
+
+<#
+    Function to create a new temporary folder.
+    It generates a unique folder name using a random file name and creates the directory in the temporary path.
+    Returns the path of the newly created temporary folder.
+#>
+function NewTemporaryFolder {
+    $tempFolder = Join-Path (GetTemporaryPath) ([System.IO.Path]::GetRandomFileName())
+    New-Item -Path $tempFolder -ItemType Directory | Out-Null
+    return $tempFolder
+}
+
 function CloneIntoNewFolder {
     Param(
         [string] $actor,
@@ -1346,8 +950,7 @@ function CloneIntoNewFolder {
         [bool] $directCommit
     )
 
-    $baseFolder = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
-    New-Item $baseFolder -ItemType Directory | Out-Null
+    $baseFolder = NewTemporaryFolder
     Set-Location $baseFolder
 
     # Environment variables for hub commands
@@ -1432,13 +1035,22 @@ function CommitFromNewFolder {
             } else {
                 invoke-gh pr create --fill --head $branch --repo $env:GITHUB_REPOSITORY --base $headBranch --body "$body"
             }
-
-            if ($settings.commitOptions.pullRequestAutoMerge) {
-                invoke-gh pr merge --auto --squash --delete-branch
-            }
         }
         catch {
             OutputError("GitHub actions are not allowed to create Pull Requests (see GitHub Organization or Repository Actions Settings). You can create the PR manually by navigating to $($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/tree/$branch")
+        }
+
+        # Set up auto-merge for the Pull Request if specified in settings
+        if ($settings.commitOptions.pullRequestAutoMerge) {
+            try {
+                if (($settings.commitOptions.pullRequestMergeMethod).ToLowerInvariant() -eq "merge") {
+                    invoke-gh pr merge --auto --merge --delete-branch
+                } else {
+                    invoke-gh pr merge --auto --squash --delete-branch
+                }
+            } catch {
+                OutputError("Could not set up auto-merge for the Pull Request with merge method $($settings.commitOptions.pullRequestMergeMethod)")
+            }
         }
         return $true
     }
@@ -1649,7 +1261,8 @@ function CreateDevEnv {
         [string] $containerName = "",
         [string] $licenseFileUrl = "",
         [switch] $accept_insiderEula,
-        [switch] $clean
+        [switch] $clean,
+        [string] $customSettings = ""
     )
 
     if ($PSCmdlet.ParameterSetName -ne $kind) {
@@ -1691,6 +1304,7 @@ function CreateDevEnv {
             "baseFolder"   = $baseFolder
             "project"      = $project
             "workflowName" = $workflowName
+            "customSettings" = $customSettings
         }
         if ($caller -eq "local") { $params += @{ "userName" = $userName } }
         $settings = ReadSettings @params
@@ -1848,7 +1462,7 @@ function CreateDevEnv {
         }
 
         if ($settings.versioningStrategy -eq -1) {
-            if ($kind -eq "cloud") { throw "Versioningstrategy -1 cannot be used on cloud" }
+            if ($kind -eq "cloud") { throw "versioningStrategy -1 cannot be used on cloud" }
             $artifactVersion = [Version]$settings.artifact.Split('/')[4]
             $runAlPipelineParams += @{
                 "appVersion"  = "$($artifactVersion.Major).$($artifactVersion.Minor)"
@@ -1857,13 +1471,24 @@ function CreateDevEnv {
             }
         }
         else {
-            if (($settings.versioningStrategy -band 16) -eq 16) {
-                $runAlPipelineParams += @{
-                    "appVersion" = $settings.repoVersion
-                }
-            }
             $appBuild = 0
             $appRevision = 0
+            if (($settings.versioningStrategy -band 16) -eq 16) {
+                # For versioningStrategy +16, the version number is taken from repoVersion setting
+                $repoVersion = [System.Version]$settings.repoVersion
+                if (($settings.versioningStrategy -band 15) -eq 3) {
+                    # For versioning strategy 3, we need to get the build number from repoVersion setting
+                    if ($repoVersion.Build -eq -1) {
+                        Write-Host "WARNING: RepoVersion setting only contains Major.Minor version. When using versioningStrategy 3, it should contain 3 digits"
+                    }
+                    else {
+                        $appBuild = $repoVersion.Build
+                    }
+                }
+                $runAlPipelineParams += @{
+                    "appVersion" = "$($repoVersion.Major).$($repoVersion.Minor)"
+                }
+            }
             switch ($settings.versioningStrategy -band 15) {
                 2 {
                     # USE DATETIME
@@ -1989,7 +1614,8 @@ function CreateDevEnv {
             "enablePerTenantExtensionCop",
             "enableUICop",
             "enableCodeAnalyzersOnTestApps",
-            "useCompilerFolder" | ForEach-Object {
+            "useCompilerFolder",
+            "reportSuppressedDiagnostics" | ForEach-Object {
                 if ($settings."$_") { $runAlPipelineParams += @{ "$_" = $true } }
             }
 
@@ -2458,7 +2084,7 @@ function GetFoldersFromAllProjects {
         $projects = GetProjectsFromRepository -baseFolder $baseFolder -projectsFromSettings $settings.projects
         $folders = @()
         foreach($project in $projects) {
-            $projectSettings = ReadSettings -project $project -baseFolder $baseFolder -silent
+            $projectSettings = ReadSettings -project $project -baseFolder $baseFolder
             ResolveProjectFolders -baseFolder $baseFolder -project $project -projectSettings ([ref] $projectSettings)
             $folders += @( @($projectSettings.appFolders) + @($projectSettings.testFolders) + @($projectSettings.bcptTestFolders) | ForEach-Object {
                 $fullPath = Join-Path $baseFolder "$project/$_" -Resolve
@@ -2476,14 +2102,24 @@ function GetFoldersFromAllProjects {
 }
 
 function GetPackageVersion($packageName) {
-    $alGoPackages = Get-Content -Path "$PSScriptRoot\Packages.json" | ConvertFrom-Json
+    $projFilePath = "$PSScriptRoot\Environment.Packages.proj"
 
-    # Check if the package is in the list of packages
-    if ($alGoPackages.PSobject.Properties.name -eq $PackageName) {
-        return $alGoPackages."$PackageName"
+    # Check if the proj file exists
+    if (-not (Test-Path $projFilePath)) {
+        throw "Environment.Packages.proj file not found at $projFilePath"
+    }
+
+    # Load the XML content
+    [xml]$projXml = Get-Content -Path $projFilePath
+
+    # Find the PackageReference with the specified Include (package name)
+    $packageReference = $projXml.Project.ItemGroup.PackageReference | Where-Object { $_.Include -eq $packageName }
+
+    if ($packageReference) {
+        return $packageReference.Version
     }
     else {
-        throw "Package $PackageName is not in the list of packages"
+        throw "Package $packageName is not in the list of packages"
     }
 }
 
@@ -2559,6 +2195,12 @@ function ConnectAz {
     }
 }
 
+<#
+    .SYNOPSIS
+    Output a message and an array of strings in a formatted way.
+
+    Deprecated: Use OutputArray function from DebugLogHelper module.
+#>
 function OutputMessageAndArray {
     Param(
         [string] $message,

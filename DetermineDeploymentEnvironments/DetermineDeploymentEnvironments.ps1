@@ -3,12 +3,17 @@ Param(
     [string] $getEnvironments,
     [Parameter(HelpMessage = "Type of deployment (CD, Publish or All)", Mandatory = $true)]
     [ValidateSet('CD','Publish','All')]
-    [string] $type
+    [string] $type,
+    [Parameter(HelpMessage = "If true, allow deploying to environments that do not exist (will create a new GitHub environment)", Mandatory = $false)]
+    [bool] $createEnvIfNotExists
 )
+OutputDebugFunctionCall
 
 function IsGitHubPagesAvailable() {
+    OutputDebugFunctionCall
     $headers = GetHeaders -token $env:GITHUB_TOKEN
     $url = "$($ENV:GITHUB_API_URL)/repos/$($ENV:GITHUB_REPOSITORY)/pages"
+    OutputDebug "Url: $url"
     try {
         Write-Host "Requesting GitHub Pages settings from GitHub"
         $ghPages = (InvokeWebRequest -Headers $headers -Uri $url).Content | ConvertFrom-Json
@@ -20,8 +25,10 @@ function IsGitHubPagesAvailable() {
 }
 
 function GetGitHubEnvironments() {
+    OutputDebugFunctionCall
     $headers = GetHeaders -token $env:GITHUB_TOKEN
     $url = "$($ENV:GITHUB_API_URL)/repos/$($ENV:GITHUB_REPOSITORY)/environments"
+    OutputDebug "Url: $url"
     try {
         Write-Host "Requesting environments from GitHub"
         $ghEnvironments = @(((InvokeWebRequest -Headers $headers -Uri $url).Content | ConvertFrom-Json).environments)
@@ -34,6 +41,7 @@ function GetGitHubEnvironments() {
 }
 
 function Get-BranchesFromPolicy($ghEnvironment) {
+    OutputDebugFunctionCall
     if ($ghEnvironment) {
         # Environment is defined in GitHub - check protection rules
         $headers = GetHeaders -token $env:GITHUB_TOKEN
@@ -98,7 +106,12 @@ $unknownEnvironment = 0
 if (!($environments)) {
     # If no environments are defined and the user specified a single environment, use that environment
     # This allows the user to specify a single environment without having to define it in the settings
-    if ($getenvironments -notcontains '*' -and $getenvironments -notcontains '?' -and $getenvironments -notcontains ',') {
+    # Check that the environment name doesn't contain wildcards or comma (which would indicate a pattern)
+    if ($getEnvironments.IndexOf('*') -lt 0 -and $getEnvironments.IndexOf('?') -lt 0 -and $getEnvironments.IndexOf(',') -lt 0) {
+        # Only allow creating unknown environments if explicitly requested
+        if (-not $createEnvIfNotExists) {
+            throw "Environment '$getEnvironments' does not exist in GitHub nor in the AL-Go settings. To create a new GitHub environment for this deployment, run the workflow again with 'Create environment if it does not exist' enabled."
+        }
         $envName = $getEnvironments.Split(' ')[0]
         $deploymentEnvironments += @{
             "$getEnvironments" = @{
